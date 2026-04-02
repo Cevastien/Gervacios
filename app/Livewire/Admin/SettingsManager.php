@@ -1,0 +1,508 @@
+<?php
+
+namespace App\Livewire\Admin;
+
+use App\Jobs\SendSmsJob;
+use App\Models\AdminLog;
+use App\Models\BlockedIp;
+use App\Models\Setting;
+use App\Services\AutomationSettings;
+use App\Services\FacebookPostService;
+use App\Services\NotificationService;
+use App\Support\IpBlocklist;
+use Illuminate\Support\Facades\Bus;
+use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\Validator;
+use Livewire\Attributes\Computed;
+use Livewire\Component;
+
+class SettingsManager extends Component
+{
+    /** @var array<string, array{property: string, max: int}> */
+    private const SECRET_SETTING_FIELDS = [
+        'paymongo_public_key' => ['property' => 'paymongoPublicKey', 'max' => 500],
+        'paymongo_secret_key' => ['property' => 'paymongoSecretKey', 'max' => 500],
+        'paymongo_webhook_secret' => ['property' => 'paymongoWebhookSecret', 'max' => 500],
+        'semaphore_api_key' => ['property' => 'semaphoreApiKey', 'max' => 255],
+        'fb_access_token' => ['property' => 'fbAccessToken', 'max' => 1000],
+    ];
+
+    // Facebook
+    public string $fbPageId = '';
+
+    protected string $fbAccessToken = '';
+    public string $syncMessage = '';
+    public string $syncStatus = '';
+
+    // PayMongo
+    protected string $paymongoPublicKey = '';
+
+    protected string $paymongoSecretKey = '';
+
+    protected string $paymongoWebhookSecret = '';
+    public int $depositPerGuest = 500;
+
+    public int $reservationFee = 150;
+
+    public string $paymongoMessage = '';
+    public string $paymongoStatus = '';
+
+    // Semaphore SMS (Philippines)
+    protected string $semaphoreApiKey = '';
+
+    public string $semaphoreSenderName = '';
+
+    public bool $smsEnabled = true;
+
+    public string $semaphoreMessage = '';
+
+    public string $semaphoreStatus = '';
+
+    public string $semaphoreBalanceSummary = '';
+
+    public string $semaphoreTestMessage = '';
+
+    public string $semaphoreTestStatus = '';
+
+    // Unified touchpoints & automation
+    public bool $automationMasterEnabled = true;
+
+    /** When on, PWD waitlist entries require a ♿ table; priority queue order is unchanged. */
+    public bool $queuePwdRequiresAccessibleTable = false;
+
+    public int $automationQueueHoldMinutes = 1;
+
+    public int $automationNoShowMinutes = 30;
+
+    public int $tableCleaningMinutes = 10;
+
+    public bool $peakHoursLearnFromQueue = true;
+
+    public string $peakHoursStart = '17:00';
+
+    public string $peakHoursEnd = '22:00';
+
+    public string $adminAlertPhone = '';
+
+    public string $blockedIpsText = '';
+
+    /** Snapshot of blocklist when the page loaded (normalized) — used to detect edits. */
+    protected string $blockedIpsSnapshot = '';
+
+    /** Required when saving a changed IP blocklist. */
+    public string $settingsPasswordConfirm = '';
+
+    public string $unifiedMessage = '';
+
+    public string $unifiedStatus = '';
+
+    /** Which settings modal is open (unified + integration keys). */
+    public ?string $settingsModal = null;
+
+    public function mount(): void
+    {
+        $this->automationMasterEnabled = Setting::get('automation_master_enabled', '1') === '1';
+        $this->queuePwdRequiresAccessibleTable = Setting::get('queue_pwd_requires_accessible_table', '0') === '1';
+        $this->automationQueueHoldMinutes = (int) Setting::get('automation_queue_hold_minutes', config('automation.queue_hold_minutes', 1));
+        $this->automationNoShowMinutes = (int) Setting::get('automation_no_show_minutes', config('automation.no_show_minutes_after_booking', 30));
+        $this->tableCleaningMinutes = (int) Setting::get('table_cleaning_minutes', (string) config('automation.table_cleaning_minutes', 10));
+        $learnDefault = config('automation.peak_hours_learn_from_queue', true) ? '1' : '0';
+        $this->peakHoursLearnFromQueue = Setting::get('peak_hours_learn_from_queue', $learnDefault) === '1';
+        $this->peakHoursStart = (string) Setting::get('peak_hours_start', config('automation.peak_hours_start', '17:00'));
+        $this->peakHoursEnd = (string) Setting::get('peak_hours_end', config('automation.peak_hours_end', '22:00'));
+        $this->adminAlertPhone = (string) Setting::get('admin_alert_phone', '');
+        $this->blockedIpsText = BlockedIp::orderBy('ip_address')->pluck('ip_address')->implode("\n");
+        $this->blockedIpsSnapshot = $this->normalizeBlockedIpsText($this->blockedIpsText);
+
+        $this->fbPageId = Setting::get('fb_page_id', '');
+
+        $this->depositPerGuest = (int) Setting::get('deposit_per_guest', 500);
+
+        $this->reservationFee = (int) Setting::get('reservation_fee', 150);
+
+        $this->semaphoreSenderName = (string) Setting::get('semaphore_sender_name', config('services.semaphore.sender_name', 'CafeGervacios'));
+        $this->smsEnabled = Setting::get('sms_enabled', '1') === '1';
+
+        $this->openModalFromQueryIfPresent();
+        if ($this->settingsModal === null && $this->shouldAutoOpenQrModal()) {
+            $this->openSettingsModal('qr');
+        }
+    }
+
+    /**
+     * Protected credentials are not in the Livewire snapshot; reload from settings on each request.
+     */
+    public function hydrate(): void
+    {
+        $this->loadSecretCredentialsFromSettings();
+    }
+
+    private function loadSecretCredentialsFromSettings(): void
+    {
+        $this->fbAccessToken = (string) Setting::get('fb_access_token', '');
+        $this->paymongoPublicKey = Setting::get('paymongo_public_key', config('services.paymongo.public_key', ''));
+        $this->paymongoSecretKey = Setting::get('paymongo_secret_key', config('services.paymongo.secret_key', ''));
+        $this->paymongoWebhookSecret = Setting::get('paymongo_webhook_secret', config('services.paymongo.webhook_secret', ''));
+        $this->semaphoreApiKey = (string) Setting::get('semaphore_api_key', config('services.semaphore.api_key', ''));
+    }
+
+    /** After QR upload/crop validation errors, reopen the QR modal. */
+    protected function shouldAutoOpenQrModal(): bool
+    {
+        if (session('success') === 'Image uploaded. Now crop the QR code area.') {
+            return true;
+        }
+
+        $bag = session('errors');
+        if ($bag === null || ! is_object($bag) || ! method_exists($bag, 'has')) {
+            return false;
+        }
+
+        foreach ([
+            'qr_image',
+            'qr_account_name',
+            'qr_account_number',
+            'qr_payment_label',
+            'crop_x',
+            'crop_y',
+            'crop_width',
+            'crop_height',
+        ] as $field) {
+            if ($bag->has($field)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /** Open the matching modal when visiting e.g. /admin/settings?modal=paymongo */
+    protected function openModalFromQueryIfPresent(): void
+    {
+        $modal = request()->query('modal');
+        if (! is_string($modal) || $modal === '') {
+            return;
+        }
+
+        $allowed = ['devices', 'timing', 'peak', 'alerts', 'paymongo', 'semaphore', 'facebook', 'qr'];
+        if (! in_array($modal, $allowed, true)) {
+            return;
+        }
+
+        $this->openSettingsModal($modal);
+    }
+
+    public function openSettingsModal(string $section): void
+    {
+        $this->settingsModal = $section;
+    }
+
+    public function closeSettingsModal(): void
+    {
+        $this->settingsModal = null;
+        $this->settingsPasswordConfirm = '';
+        $this->restoreSettingsModalFocus();
+    }
+
+    /**
+     * Persist secret/credential fields without exposing them as public Livewire properties.
+     * Empty input is ignored so opening a modal with blank password fields does not wipe stored keys.
+     */
+    public function updateSecret(string $field, string $value): void
+    {
+        if (! isset(self::SECRET_SETTING_FIELDS[$field])) {
+            return;
+        }
+
+        $meta = self::SECRET_SETTING_FIELDS[$field];
+        $value = trim($value);
+        if ($value === '') {
+            return;
+        }
+
+        if (strlen($value) > $meta['max']) {
+            return;
+        }
+
+        $this->{$meta['property']} = $value;
+        Setting::set($field, $value);
+    }
+
+    private function restoreSettingsModalFocus(): void
+    {
+        $this->js(<<<'JS'
+            setTimeout(() => {
+                const t = window.__settingsModalPreviousFocus;
+                if (t && document.body.contains(t) && typeof t.focus === 'function') {
+                    try { t.focus(); } catch (e) {}
+                }
+                window.__settingsModalPreviousFocus = null;
+            }, 10);
+        JS);
+    }
+
+    #[Computed]
+    public function blockedIpsDirty(): bool
+    {
+        return $this->normalizeBlockedIpsText($this->blockedIpsText) !== $this->blockedIpsSnapshot;
+    }
+
+    #[Computed]
+    public function paymongoSecretKeyConfigured(): bool
+    {
+        return $this->paymongoSecretKey !== '';
+    }
+
+    #[Computed]
+    public function semaphoreApiKeyConfigured(): bool
+    {
+        return $this->semaphoreApiKey !== '';
+    }
+
+    private function normalizeBlockedIpsText(string $text): string
+    {
+        return collect(preg_split('/\r\n|\r|\n/', $text))
+            ->map(fn ($l) => trim($l))
+            ->filter(fn ($l) => $l !== '')
+            ->sort()
+            ->values()
+            ->implode("\n");
+    }
+
+    public function saveUnifiedFromModal(): void
+    {
+        $this->saveUnified();
+        if ($this->getErrorBag()->has('settingsPasswordConfirm')) {
+            return;
+        }
+        $this->settingsModal = null;
+        $this->restoreSettingsModalFocus();
+    }
+
+    public function savePaymongoFromModal(): void
+    {
+        $this->savePaymongo();
+        $this->settingsModal = null;
+        $this->restoreSettingsModalFocus();
+    }
+
+    public function saveSemaphoreFromModal(): void
+    {
+        $this->saveSemaphore();
+        $this->settingsModal = null;
+        $this->restoreSettingsModalFocus();
+    }
+
+    public function saveFacebookFromModal(): void
+    {
+        $this->saveCredentials();
+        $this->settingsModal = null;
+        $this->restoreSettingsModalFocus();
+    }
+
+    public function saveUnified(): void
+    {
+        $rules = [
+            'automationQueueHoldMinutes' => 'required|integer|min:1|max:120',
+            'automationNoShowMinutes' => 'required|integer|min:5|max:240',
+            'tableCleaningMinutes' => 'required|integer|min:0|max:240',
+            'peakHoursStart' => ['required', 'regex:/^([01]\d|2[0-3]):[0-5]\d$/'],
+            'peakHoursEnd' => ['required', 'regex:/^([01]\d|2[0-3]):[0-5]\d$/'],
+            'adminAlertPhone' => 'nullable|string|max:20',
+            'blockedIpsText' => 'nullable|string|max:5000',
+        ];
+
+        if ($this->blockedIpsDirty) {
+            $rules['settingsPasswordConfirm'] = 'required|string';
+        }
+
+        $this->validate($rules);
+
+        if ($this->blockedIpsDirty) {
+            $user = auth()->user();
+            if (!$user || !Hash::check($this->settingsPasswordConfirm, $user->password)) {
+                $this->addError('settingsPasswordConfirm', 'Enter your current password to change the blocked IP list.');
+                return;
+            }
+        }
+
+        $this->settingsPasswordConfirm = '';
+
+        Setting::set('automation_master_enabled', $this->automationMasterEnabled ? '1' : '0');
+        Setting::set('automation_queue_hold_minutes', (string) $this->automationQueueHoldMinutes);
+        Setting::set('automation_no_show_minutes', (string) $this->automationNoShowMinutes);
+        Setting::set('table_cleaning_minutes', (string) $this->tableCleaningMinutes);
+        Setting::set('queue_pwd_requires_accessible_table', $this->queuePwdRequiresAccessibleTable ? '1' : '0');
+        Setting::set('peak_hours_learn_from_queue', $this->peakHoursLearnFromQueue ? '1' : '0');
+        Setting::set('peak_hours_start', $this->peakHoursStart);
+        Setting::set('peak_hours_end', $this->peakHoursEnd);
+        Setting::set('admin_alert_phone', $this->adminAlertPhone);
+
+        AutomationSettings::forgetDynamicPeakQueueHoursCache();
+
+        $parsed = collect(preg_split('/\r\n|\r|\n/', $this->blockedIpsText))
+            ->map(fn ($l) => trim($l))
+            ->filter(fn ($l) => $l !== '' && filter_var($l, FILTER_VALIDATE_IP));
+
+        $hadLoopbackInInput = $parsed->contains(fn ($ip) => IpBlocklist::isExemptFromBlocking($ip));
+        $ips = IpBlocklist::filterStorable($parsed);
+
+        BlockedIp::query()->delete();
+        foreach ($ips as $ip) {
+            BlockedIp::create(['ip_address' => $ip, 'reason' => 'admin']);
+        }
+
+        $this->blockedIpsText = collect($ips)->implode("\n");
+        $this->blockedIpsSnapshot = $this->normalizeBlockedIpsText($this->blockedIpsText);
+
+        AdminLog::record('update_settings', null, null, 'Updated unified / automation settings');
+        $this->unifiedMessage = 'Unified settings saved.';
+        if ($hadLoopbackInInput) {
+            $this->unifiedMessage .= ' Localhost (127.0.0.1 / ::1) is never blocked.';
+        }
+        $this->unifiedStatus = 'success';
+    }
+
+    public function saveCredentials(): void
+    {
+        Validator::make(
+            [
+                'fbPageId' => $this->fbPageId,
+                'fbAccessToken' => $this->fbAccessToken,
+            ],
+            [
+                'fbPageId' => 'nullable|string|max:255',
+                'fbAccessToken' => 'nullable|string|max:1000',
+            ]
+        )->validate();
+
+        Setting::set('fb_page_id', $this->fbPageId);
+        Setting::set('fb_access_token', $this->fbAccessToken);
+
+        AdminLog::record('update_settings', null, null, 'Updated Facebook credentials');
+        $this->syncMessage = 'Credentials saved.';
+        $this->syncStatus = 'success';
+    }
+
+    public function syncNow(): void
+    {
+        $this->syncMessage = '';
+        $this->syncStatus = '';
+
+        $service = app(FacebookPostService::class);
+
+        if (!$service->isConfigured()) {
+            $this->syncMessage = 'Facebook API not configured. Please enter Page ID and Access Token first.';
+            $this->syncStatus = 'error';
+            return;
+        }
+
+        $count = $service->sync();
+
+        if ($count === -1) {
+            $this->syncMessage = 'Sync failed. Check that your Page ID and Access Token are correct.';
+            $this->syncStatus = 'error';
+        } else {
+            $this->syncMessage = "{$count} post(s) synced successfully.";
+            $this->syncStatus = 'success';
+        }
+    }
+
+    public function savePaymongo(): void
+    {
+        Validator::make(
+            [
+                'paymongoPublicKey' => $this->paymongoPublicKey,
+                'paymongoSecretKey' => $this->paymongoSecretKey,
+                'paymongoWebhookSecret' => $this->paymongoWebhookSecret,
+                'depositPerGuest' => $this->depositPerGuest,
+                'reservationFee' => $this->reservationFee,
+            ],
+            [
+                'paymongoPublicKey' => 'nullable|string|max:500',
+                'paymongoSecretKey' => 'nullable|string|max:500',
+                'paymongoWebhookSecret' => 'nullable|string|max:500',
+                'depositPerGuest' => 'required|integer|min:0|max:100000',
+                'reservationFee' => 'required|integer|min:0|max:100000',
+            ]
+        )->validate();
+
+        Setting::set('paymongo_public_key', $this->paymongoPublicKey);
+        Setting::set('paymongo_secret_key', $this->paymongoSecretKey);
+        Setting::set('paymongo_webhook_secret', $this->paymongoWebhookSecret);
+        Setting::set('deposit_per_guest', (string) $this->depositPerGuest);
+        Setting::set('reservation_fee', (string) $this->reservationFee);
+
+        AdminLog::record('update_settings', null, null, 'Updated PayMongo settings');
+        $this->paymongoMessage = 'PayMongo settings saved.';
+        $this->paymongoStatus = 'success';
+    }
+
+    public function saveSemaphore(): void
+    {
+        Validator::make(
+            [
+                'semaphoreApiKey' => $this->semaphoreApiKey,
+                'semaphoreSenderName' => $this->semaphoreSenderName,
+            ],
+            [
+                'semaphoreApiKey' => 'nullable|string|max:255',
+                'semaphoreSenderName' => 'nullable|string|max:32',
+            ]
+        )->validate();
+
+        Setting::set('semaphore_api_key', $this->semaphoreApiKey);
+        Setting::set('semaphore_sender_name', $this->semaphoreSenderName !== '' ? $this->semaphoreSenderName : 'CafeGervacios');
+        Setting::set('sms_enabled', $this->smsEnabled ? '1' : '0');
+
+        AdminLog::record('update_settings', null, null, 'Updated Semaphore SMS settings');
+        $this->semaphoreMessage = 'Semaphore settings saved.';
+        $this->semaphoreStatus = 'success';
+    }
+
+    public function checkSemaphoreBalance(): void
+    {
+        $this->semaphoreBalanceSummary = '';
+        $data = app(NotificationService::class)->fetchAccountCredits();
+
+        if ($data === null) {
+            $this->semaphoreBalanceSummary = 'Could not load balance. Save a valid API key first.';
+
+            return;
+        }
+
+        $credits = $data['credit_balance'] ?? '—';
+        $name = $data['account_name'] ?? ($data['account'] ?? '');
+        $status = $data['status'] ?? '';
+        $this->semaphoreBalanceSummary = trim("Account: {$name}" . ($status !== '' ? " ({$status})" : '') . ". Remaining SMS credits: {$credits}");
+    }
+
+    public function sendTestSms(): void
+    {
+        $this->semaphoreTestMessage = '';
+        $this->semaphoreTestStatus = '';
+
+        $this->validate([
+            'adminAlertPhone' => ['required', 'string', 'max:20'],
+        ]);
+
+        try {
+            Bus::dispatchSync(new SendSmsJob($this->adminAlertPhone, 'admin_sms_test', [
+                'venue' => config('app.name', 'Café Gervacios'),
+            ]));
+        } catch (\Throwable $e) {
+            $this->semaphoreTestMessage = $e->getMessage();
+            $this->semaphoreTestStatus = 'error';
+
+            return;
+        }
+
+        $this->semaphoreTestMessage = 'Test SMS sent via Semaphore. Check the phone number in “Admin alert phone”.';
+        $this->semaphoreTestStatus = 'success';
+    }
+
+    public function render()
+    {
+        return view('livewire.admin.settings-manager');
+    }
+}
